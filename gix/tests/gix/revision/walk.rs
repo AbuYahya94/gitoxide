@@ -34,6 +34,90 @@ fn assert_graph_use(walk: Platform<'_>, expected: bool) -> gix::Result<()> {
 }
 
 #[test]
+fn hidden_walk_cache_matches_stock_across_tips_and_bases() -> TestResult {
+    for use_graph in [false, true] {
+        let repo = crate::util::named_subrepo_opts(
+            FIXTURE,
+            ".",
+            crate::util::restricted().config_overrides([format!("core.commitGraph={use_graph}")]),
+        )?;
+        let mut cache = repo.hidden_walk_cache();
+        for (tip, hidden) in [
+            ("tip", "main"),
+            ("side", "tip"),
+            ("merge", "side"),
+            ("main", "side"),
+            ("tip", "root"),
+            ("tip", "main"),
+        ] {
+            let tip = repo.rev_parse_single(tip)?;
+            let hidden = repo.rev_parse_single(hidden)?;
+            for first_parent in [false, true] {
+                let walk = || {
+                    let walk = repo.rev_walk([tip]).with_hidden([hidden]);
+                    if first_parent { walk.first_parent_only() } else { walk }
+                };
+                assert_eq!(
+                    detached(walk().all_with_hidden_cache(&mut cache)?)?,
+                    detached(walk().all()?)?,
+                    "tip {tip}, hidden {hidden}, commit-graph {use_graph}, first parent {first_parent}"
+                );
+            }
+        }
+        let tip = repo.head_id()?;
+        let base = repo.rev_parse_single("main")?;
+        let with_override = || repo.rev_walk([tip]).with_hidden([base]).use_commit_graph(false);
+        assert_eq!(
+            detached(with_override().all_with_hidden_cache(&mut cache)?)?,
+            detached(with_override().all()?)?,
+            "explicit graph policy applies even with a populated cache"
+        );
+        assert!(
+            repo.clone()
+                .rev_walk([tip])
+                .with_hidden([base])
+                .all_with_hidden_cache(&mut cache)
+                .is_err(),
+            "the cache is bound to its original repository handle"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hidden_walk_cache_preserves_date_cutoff_with_preloaded_ancestry() -> TestResult {
+    let repo = crate::util::named_subrepo_opts(FIXTURE, "skewed", crate::util::restricted())?;
+    let mut cache = repo.hidden_walk_cache();
+    let base = repo.rev_parse_single("base")?;
+    let root = repo.rev_parse_single("root")?;
+    let tip = repo.head_id()?;
+    let preload = repo
+        .rev_walk([base])
+        .with_hidden([root])
+        .all_with_hidden_cache(&mut cache)?
+        .collect::<gix::Result<Vec<_>>>()?;
+    assert_eq!(preload.len(), 7, "preload the whole hidden chain");
+    drop(preload);
+
+    let walk = || repo.rev_walk([tip]).with_hidden([base]);
+    let stock = detached(walk().all()?)?;
+    assert!(
+        stock.iter().any(|info| info.id == root.detach()),
+        "the stock date cutoff leaves the skewed root visible"
+    );
+    assert_eq!(
+        detached(walk().all_with_hidden_cache(&mut cache)?)?,
+        stock,
+        "the cutoff only marks metadata loaded during the current paint"
+    );
+    Ok(())
+}
+
+fn detached(walk: gix::revision::Walk<'_>) -> gix::Result<Vec<gix::traverse::commit::Info>> {
+    walk.map(|info| info.map(gix::revision::walk::Info::detach)).collect()
+}
+
+#[test]
 fn topological_sorting_matches_git() -> TestResult {
     let repo = crate::named_repo(FIXTURE)?;
     let tip_commit_id = repo.head_id()?;
@@ -238,18 +322,22 @@ fn shallow_commits_are_roots_even_with_hidden_history_and_a_stale_graph() -> Tes
         );
 
         let repo = crate::util::named_subrepo_opts(FIXTURE, "shallow-with-objects", crate::util::restricted())?;
-        let mut actual = ids(repo
-            .rev_walk([repo.head_id()?])
-            .sorting(sorting)
-            .with_hidden([repo.rev_parse_single("main")?])
-            .with_commit_graph(Some(repo.commit_graph()?))
-            .all()?)?;
+        let tip = repo.head_id()?;
+        let hidden = repo.rev_parse_single("main")?;
+        let walk = || repo.rev_walk([tip]).sorting(sorting).with_hidden([hidden]);
+        let mut actual = ids(walk().with_commit_graph(Some(repo.commit_graph()?)).all()?)?;
         let mut expected = baseline(&full, "shallow-hidden.baseline")?;
         actual.sort();
         expected.sort();
         assert_eq!(
             actual, expected,
             "hidden painting stops at shallow main, preserving root reached through side"
+        );
+        let mut cache = repo.hidden_walk_cache();
+        assert_eq!(
+            detached(walk().all_with_hidden_cache(&mut cache)?)?,
+            detached(walk().all()?)?,
+            "the cache path respects shallow boundaries and preserves order"
         );
     }
     Ok(())

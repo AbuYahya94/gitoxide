@@ -2,7 +2,12 @@ use gix_hash::ObjectId;
 use gix_object::{Find, WriteTo};
 pub use gix_traverse::commit::simple::CommitTimeOrder;
 
-use crate::{Repository, Result, error::ResultExt, ext::ObjectIdExt, revision};
+use crate::{
+    Repository, Result,
+    error::{ResultExt, bail, message},
+    ext::ObjectIdExt,
+    revision,
+};
 
 /// Specify how to sort commits during a [revision::Walk] traversal.
 ///
@@ -174,6 +179,28 @@ pub struct Platform<'repo> {
     pub(crate) commit_graph: Option<gix_commitgraph::Graph>,
 }
 
+/// Commit metadata shared by a batch of [hidden walks](Platform::all_with_hidden_cache()) on one repository handle.
+///
+/// The first compatible walk pins the repository's optional on-disk commit-graph until this cache is dropped.
+/// Each walk computes fresh paint flags and a new hidden frontier for its tips and exclusions.
+/// Retained metadata grows with the number of distinct commits seen by the batch.
+pub struct HiddenWalkCache<'repo> {
+    repo: &'repo Repository,
+    commit_graph: std::cell::OnceCell<Option<gix_commitgraph::Graph>>,
+    metadata: gix_revwalk::graph::IdMap<gix_revwalk::graph::Commit<()>>,
+}
+
+impl Repository {
+    /// Start a batch of [breadth-first hidden walks](Platform::all_with_hidden_cache()) on this repository handle.
+    pub fn hidden_walk_cache(&self) -> HiddenWalkCache<'_> {
+        HiddenWalkCache {
+            repo: self,
+            commit_graph: Default::default(),
+            metadata: Default::default(),
+        }
+    }
+}
+
 impl<'repo> Platform<'repo> {
     pub(crate) fn new(tips: impl IntoIterator<Item = impl Into<ObjectId>>, repo: &'repo Repository) -> Self {
         revision::walk::Platform {
@@ -273,6 +300,7 @@ impl Platform<'_> {
     ///
     /// The side effect of this is that commits can't be returned immediately as one still has to wait and see if they may be unwanted later.
     /// This makes traversals with hidden commits more costly, with a chance to traverse all commits if the hidden and non-hidden commits are disjoint.
+    /// Use [`Self::all_with_hidden_cache()`] to reuse commit metadata across repeated breadth-first walks.
     /// Without usable commit-graph generation numbers, Git's date-based stopping heuristic limits
     /// hidden traversal; extreme clock skew can leave hidden ancestors beyond the stopping point.
     pub fn with_hidden(mut self, tips: impl IntoIterator<Item = impl Into<ObjectId>>) -> Self {
@@ -288,7 +316,53 @@ impl<'repo> Platform<'repo> {
     ///
     /// An ancestor can still be reached along another included path. The predicate is called at
     /// most once per commit, and its call order depends on the traversal. Use [`Self::all()`] for no pruning.
-    pub fn selected(self, mut filter: impl FnMut(&gix_hash::oid) -> bool + 'repo) -> Result<revision::Walk<'repo>> {
+    pub fn selected(self, filter: impl FnMut(&gix_hash::oid) -> bool + 'repo) -> Result<revision::Walk<'repo>> {
+        self.selected_inner(filter, None)
+    }
+
+    /// Walk as in [`Self::all()`], sharing commit metadata between breadth-first hidden walks.
+    ///
+    /// Create `cache` with [`Repository::hidden_walk_cache()`] on the same repository handle and
+    /// release each walk and its attached results before reusing the cache. The cache uses the
+    /// default commit-graph policy. Walks with explicit graph overrides, boundaries, other sort orders,
+    /// shallow history, or active replacements use the regular traversal.
+    ///
+    /// Returns an error if the cache belongs to a different repository handle.
+    ///
+    /// ```
+    /// # fn visit(repo: &gix::Repository, tips: &[gix::ObjectId], base: gix::ObjectId) -> gix::Result<()> {
+    /// let mut cache = repo.hidden_walk_cache();
+    /// for &tip in tips {
+    ///     let ids = repo
+    ///         .rev_walk([tip])
+    ///         .with_hidden([base])
+    ///         .all_with_hidden_cache(&mut cache)?
+    ///         .map(|info| info.map(|info| info.id))
+    ///         .collect::<gix::Result<Vec<_>>>()?;
+    ///     // Use the detached IDs for this tip.
+    ///     # let _ = ids;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn all_with_hidden_cache<'walk>(self, cache: &'walk mut HiddenWalkCache<'_>) -> Result<revision::Walk<'walk>>
+    where
+        'repo: 'walk,
+    {
+        if !std::ptr::eq(self.repo, cache.repo) {
+            bail!(message("The hidden walk cache belongs to a different repository handle").validation());
+        }
+        self.selected_inner(|_| true, Some(cache))
+    }
+
+    fn selected_inner<'walk>(
+        self,
+        mut filter: impl FnMut(&gix_hash::oid) -> bool + 'walk,
+        hidden_cache: Option<&'walk mut HiddenWalkCache<'_>>,
+    ) -> Result<revision::Walk<'walk>>
+    where
+        'repo: 'walk,
+    {
         let Platform {
             repo,
             tips,
@@ -304,15 +378,37 @@ impl<'repo> Platform<'repo> {
             repo,
             shallow: repo.shallow_commits()?,
         };
-        let commit_graph = if repo.has_object_replacements() || objects.shallow.is_some() {
-            None
-        } else if use_commit_graph.map_or_else(|| repo.config.may_use_commit_graph(), Ok)? {
+        let unmodified = objects.shallow.is_none() && !repo.has_object_replacements();
+        let use_disk_graph = unmodified && use_commit_graph.map_or_else(|| repo.config.may_use_commit_graph(), Ok)?;
+        let has_boundary = !boundary.is_empty();
+        let filter = move |id: &gix_hash::oid| filter(id) && boundary.binary_search(&id.to_owned()).is_err();
+        if let Some(cache) = hidden_cache
+            && !hidden.is_empty()
+            && matches!(sorting, Sorting::BreadthFirst)
+            && !has_boundary
+            && unmodified
+            && use_commit_graph.is_none()
+            && commit_graph.is_none()
+        {
+            let disk_graph = cache
+                .commit_graph
+                .get_or_init(|| if use_disk_graph { repo.commit_graph().ok() } else { None })
+                .as_ref();
+            let inner = gix_traverse::commit::Simple::filtered(tips, objects, filter)
+                .parents(parents)
+                .hide_with_cache(hidden, &mut cache.metadata, disk_graph)?;
+            return Ok(revision::Walk {
+                repo,
+                inner: Box::new(inner),
+            });
+        }
+
+        let commit_graph = if use_disk_graph {
             commit_graph.or_else(|| repo.commit_graph().ok())
         } else {
             None
         };
-        let filter = move |id: &gix_hash::oid| filter(id) && boundary.binary_search(&id.to_owned()).is_err();
-        let inner: Box<dyn Iterator<Item = Result<gix_traverse::commit::Info>> + 'repo> =
+        let inner: Box<dyn Iterator<Item = Result<gix_traverse::commit::Info>> + 'walk> =
             if let Some(simple_sorting) = sorting.into_simple() {
                 Box::new(
                     gix_traverse::commit::Simple::filtered(tips, objects, filter)
