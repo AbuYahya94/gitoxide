@@ -4,6 +4,10 @@ use gix_object::Kind;
 
 /// A trait to model putting objects at a given pack `offset` into a cache, and fetching them.
 ///
+/// The `pack_id` arguments are opaque, process-local keys for an open pack.
+/// Reopening a pack assigns a new key, even if its [location ID](crate::data::File::id) stays the same.
+/// If these keys are exhausted, pack decoding bypasses the cache.
+///
 /// It is used to speed up [pack traversals][crate::index::File::traverse()].
 pub trait DecodeEntry {
     /// Store a fully decoded object at `offset` of `kind` with `compressed_size` and `data` in the cache.

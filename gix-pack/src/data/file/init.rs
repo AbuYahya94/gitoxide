@@ -1,9 +1,14 @@
 use gix_error::Result;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use gix_error::{ResultExt, bail, message};
 
 use crate::data;
+
+static NEXT_CACHE_ID: AtomicU32 = AtomicU32::new(0);
 
 /// Instantiation
 impl data::File<crate::MMap> {
@@ -52,6 +57,10 @@ where
             data,
             path,
             id,
+            // A replacement pack can reuse its location ID while an old cache entry is still live.
+            cache_id: NEXT_CACHE_ID
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .ok(),
             version: kind,
             num_objects,
             object_hash,

@@ -81,14 +81,11 @@ pub enum Version {
 pub struct File<T = MMap> {
     data: T,
     path: std::path::PathBuf,
-    /// A value to represent this pack uniquely when used with cache lookup, or a way to identify this pack by its location on disk.
-    /// The same location on disk should yield the same id.
+    /// Identifies this pack's location within its owning object store.
     ///
-    /// These must be unique per pack and must be stable, that is they don't change if the pack doesn't change.
-    /// If the same id is assigned (or reassigned) to different packs, pack creation or cache access will fail in hard-to-debug ways.
-    ///
-    /// This value is controlled by the owning object store, which can use it in whichever way it wants as long as the above constraints are met.
+    /// Object stores can assign this value, provided that each pack has a unique ID while its locations are in use.
     pub id: Id,
+    cache_id: Option<u32>,
     version: Version,
     num_objects: u32,
     /// The kind of hash contained within. This is entirely determined by the caller, and repositories have to know which hash to use
