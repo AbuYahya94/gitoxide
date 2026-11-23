@@ -15,9 +15,11 @@ pub struct Options<'a> {
     pub shallow: &'a Shallow,
     /// Describe how to handle tags when fetching.
     pub tags: Tags,
-    /// If `true`, if we fetch from a remote that only offers shallow clones, the operation will fail with an error
-    /// instead of writing the shallow boundary to the shallow file.
+    /// Reject shallow updates from the remote when no depth change was requested.
     pub reject_shallow_remote: bool,
+    /// Accept remote shallow boundaries during an initial clone even without a depth request.
+    /// Enable this only for a newly created clone. [`Self::reject_shallow_remote`] takes precedence.
+    pub accept_shallow_remote: bool,
 }
 
 /// For use in [`crate::Handshake::prepare_lsrefs_or_extract_refmap()`] and [`fetch`](crate::fetch()).
@@ -41,6 +43,8 @@ pub struct Context<'a, T> {
 
 #[cfg(feature = "fetch")]
 mod with_fetch {
+    use std::sync::atomic::AtomicBool;
+
     use bstr::ByteSlice;
     use gix_error::Result;
 
@@ -77,6 +81,15 @@ mod with_fetch {
         /// Returns `true` if wants were added, or `false` if the negotiation should be aborted.
         #[must_use]
         fn add_wants(&mut self, arguments: &mut fetch::Arguments, remote_ref_target_known: &[bool]) -> bool;
+        /// Return whether all `commit_ids` and their ancestors are available under the existing local shallow boundary.
+        /// The default assumes the history is unavailable when the implementation cannot inspect local objects.
+        fn has_local_commit_history(
+            &mut self,
+            _commit_ids: &[gix_hash::ObjectId],
+            _should_interrupt: &AtomicBool,
+        ) -> Result<bool> {
+            Ok(false)
+        }
         /// Typically invokes [`negotiate::one_round()`].
         fn one_round(
             &mut self,
@@ -181,9 +194,8 @@ pub use with_fetch::*;
 /// The *shallow boundary* is a set of commits whose parents are not present in the repository.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub enum Shallow {
-    /// Fetch all changes from the remote without affecting the shallow boundary at all.
-    ///
-    /// This also means that repositories that aren't shallow will remain like that.
+    /// Fetch without changing the local shallow boundary.
+    /// A fetch that requires changing the boundary fails unless an initial clone accepts the remote's boundary.
     #[default]
     NoChange,
     /// Receive update to `depth` commits in the history of the refs to fetch (from the viewpoint of the remote),

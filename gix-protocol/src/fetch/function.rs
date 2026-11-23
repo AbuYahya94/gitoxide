@@ -9,6 +9,7 @@ use gix_utils::progress::DynNestedProgress;
 
 use crate::fetch::{
     Arguments, Context, Negotiate, NegotiateOutcome, Options, Outcome, ProgressId, Shallow, Tags, negotiate,
+    response::ShallowUpdate,
 };
 #[crate::bisync::only_async]
 use crate::transport::client::async_io::{ExtendedBufRead, HandleProgress, Transport};
@@ -55,6 +56,7 @@ pub async fn fetch<P, T>(
         shallow,
         tags,
         reject_shallow_remote,
+        accept_shallow_remote,
     }: Options<'_>,
 ) -> Result<Option<Outcome>>
 where
@@ -154,13 +156,35 @@ where
 
             let mut previous_response = previous_response.expect("knowledge of a pack means a response was received");
             previous_response.append_v1_shallow_updates(v1_shallow_updates);
-            if !previous_response.shallow_updates().is_empty() && shallow_lock.is_none() {
+            let shallow_updates = previous_response.shallow_updates();
+            if !shallow_updates.is_empty() && shallow_lock.is_none() {
                 if reject_shallow_remote {
                     bail!(validation(
                         "Receiving objects from shallow remotes is prohibited due to the value of `clone.rejectShallow`"
                     ));
                 }
-                shallow_lock = acquire_shallow_lock(&shallow_file, shared_repository_permissions).map(Some)?;
+                if accept_shallow_remote {
+                    shallow_lock = acquire_shallow_lock(&shallow_file, shared_repository_permissions).map(Some)?;
+                } else {
+                    let boundary_change =
+                        || validation("The remote requires changing shallow boundaries, but no change was requested");
+                    let mut remote_shallow_roots = Vec::new();
+                    for update in shallow_updates {
+                        let ShallowUpdate::Shallow(commit_id) = update else {
+                            bail!(boundary_change());
+                        };
+                        if !shallow_commits.as_ref().is_some_and(|commits| {
+                            commits.head == *commit_id || commits.tail.binary_search(commit_id).is_ok()
+                        }) {
+                            remote_shallow_roots.push(*commit_id);
+                        }
+                    }
+                    if !remote_shallow_roots.is_empty()
+                        && !negotiate.has_local_commit_history(&remote_shallow_roots, should_interrupt)?
+                    {
+                        bail!(boundary_change());
+                    }
+                }
             }
 
             let (mut reader, may_read_to_end) =
@@ -178,11 +202,11 @@ where
             drop(reader);
 
             if let Some(shallow_lock) = shallow_lock
-                && !previous_response.shallow_updates().is_empty()
+                && !shallow_updates.is_empty()
             {
-                gix_shallow::write(shallow_lock, shallow_commits, previous_response.shallow_updates()).or_raise(
-                    || message("Could not write 'shallow' file to incorporate remote updates after fetching"),
-                )?;
+                gix_shallow::write(shallow_lock, shallow_commits, shallow_updates).or_raise(|| {
+                    message("Could not write 'shallow' file to incorporate remote updates after fetching")
+                })?;
             }
             Ok(Some(Outcome {
                 last_response: previous_response,

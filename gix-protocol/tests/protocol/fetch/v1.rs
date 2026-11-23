@@ -89,6 +89,7 @@ async fn fetch_receives_pack_after_ready_with_no_done() -> TestResult {
                 shallow: &fetch::Shallow::NoChange,
                 tags: fetch::Tags::None,
                 reject_shallow_remote: false,
+                accept_shallow_remote: false,
             },
         )
         .await?

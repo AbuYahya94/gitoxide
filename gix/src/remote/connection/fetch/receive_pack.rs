@@ -1,4 +1,8 @@
-use std::{ops::DerefMut, path::PathBuf, sync::atomic::AtomicBool};
+use std::{
+    ops::DerefMut,
+    path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use gix_error::{ResultExt, bail, message};
 use gix_odb::store::RefreshMode;
@@ -78,7 +82,9 @@ where
         P::SubProgress: 'static,
     {
         let Prepare { inner, repo } = self;
-        inner.receive(repo, progress, should_interrupt).await
+        inner
+            .receive(repo, progress, should_interrupt, /* is_initial_clone */ false)
+            .await
     }
 }
 
@@ -92,6 +98,7 @@ where
         repo: &crate::Repository,
         progress: P,
         should_interrupt: &AtomicBool,
+        is_initial_clone: bool,
     ) -> Result<Outcome>
     where
         P: gix_utils::progress::NestedProgress,
@@ -128,6 +135,7 @@ where
             shallow_file: repo.shallow_file()?,
             shallow: &self.shallow,
             tags: con.remote.fetch_tags,
+            accept_shallow_remote: is_initial_clone,
             reject_shallow_remote: Clone::REJECT_SHALLOW
                 .enrich_error(
                     repo.config
@@ -165,7 +173,7 @@ where
         let mut graph = graph_repo.revision_graph(cache.as_ref());
         let alternates = repo.objects.store_ref().alternate_db_paths()?;
         let mut negotiate = Negotiate {
-            objects: &graph_repo.objects,
+            repo: &graph_repo,
             refs: &graph_repo.refs,
             graph: &mut graph,
             alternates,
@@ -269,7 +277,7 @@ where
 }
 
 struct Negotiate<'a, 'b, 'c> {
-    objects: &'a crate::OdbHandle,
+    repo: &'a crate::Repository,
     refs: &'a gix_ref::file::Store,
     graph: &'a mut gix_negotiate::Graph<'b, 'c>,
     alternates: Vec<PathBuf>,
@@ -283,7 +291,7 @@ struct Negotiate<'a, 'b, 'c> {
 impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
     fn mark_complete_and_common_ref(&mut self) -> Result<gix_protocol::fetch::negotiate::Action> {
         negotiate::mark_complete_and_common_ref(
-            &self.objects,
+            &self.repo.objects,
             self.refs,
             {
                 let alternates = std::mem::take(&mut self.alternates);
@@ -309,13 +317,39 @@ impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
 
     fn add_wants(&mut self, arguments: &mut Arguments, remote_ref_target_known: &[bool]) -> bool {
         negotiate::add_wants(
-            self.objects,
+            &self.repo.objects,
             arguments,
             self.ref_map,
             remote_ref_target_known,
             self.shallow,
             negotiate::make_refmapping_ignore_predicate(self.tags, self.ref_map),
         )
+    }
+
+    fn has_local_commit_history(
+        &mut self,
+        commit_ids: &[gix_hash::ObjectId],
+        should_interrupt: &AtomicBool,
+    ) -> Result<bool> {
+        let result = self
+            .repo
+            .rev_walk(commit_ids.iter().copied())
+            .use_commit_graph(false)
+            .all()?
+            .try_for_each(|item| {
+                if should_interrupt.load(Ordering::Relaxed) {
+                    bail!(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "Checking the history of remote shallow boundaries was interrupted",
+                    ));
+                }
+                item.map(|_| ())
+            });
+        match result {
+            Ok(()) => Ok(true),
+            Err(err) if err.is_not_found() => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     fn one_round(

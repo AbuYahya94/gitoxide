@@ -149,6 +149,7 @@ where
             shallow: &Default::default(),
             tags: Default::default(),
             reject_shallow_remote: true,
+            accept_shallow_remote: false,
         },
     )
     .await?;
