@@ -115,6 +115,39 @@ pub(super) mod function {
         R: Send + Sync,
         F2: for<'r> Fn(crate::data::EntryRange, &'r R) -> Option<&'r [u8]> + Send + Clone,
     {
+        write_data_iter_to_stream_with_size(
+            version,
+            make_resolver,
+            entries,
+            thread_limit,
+            root_progress,
+            out,
+            should_interrupt,
+            object_hash,
+            alloc_limit_bytes,
+            pack_version,
+        )
+        .map(|(outcome, _)| outcome)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn write_data_iter_to_stream_with_size<F, F2, R>(
+        version: crate::index::Version,
+        make_resolver: F,
+        entries: &mut dyn Iterator<Item = Result<crate::data::input::Entry>>,
+        thread_limit: Option<usize>,
+        root_progress: &mut dyn DynNestedProgress,
+        out: &mut dyn io::Write,
+        should_interrupt: &AtomicBool,
+        object_hash: gix_hash::Kind,
+        alloc_limit_bytes: Option<usize>,
+        pack_version: crate::data::Version,
+    ) -> Result<(Outcome, u64)>
+    where
+        F: FnOnce() -> io::Result<(F2, R)>,
+        R: Send + Sync,
+        F2: for<'r> Fn(crate::data::EntryRange, &'r R) -> Option<&'r [u8]> + Send + Clone,
+    {
         if version != crate::index::Version::default() {
             bail!(validation(format!(
                 "Indices of type {} cannot be written, only {} are supported",
@@ -275,12 +308,16 @@ pub(super) mod function {
             progress::count("objects").expect("unit always set"),
             progress::MessageLevel::Success,
         );
-        Ok(Outcome {
-            index_version: version,
-            index_hash,
-            data_hash: pack_hash,
-            num_objects,
-        })
+        let pack_size = pack_entries_end.max(crate::data::header::SIZE as u64) + object_hash.len_in_bytes() as u64;
+        Ok((
+            Outcome {
+                index_version: version,
+                index_hash,
+                data_hash: pack_hash,
+                num_objects,
+            },
+            pack_size,
+        ))
     }
 }
 
