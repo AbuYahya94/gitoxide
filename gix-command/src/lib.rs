@@ -28,6 +28,8 @@ use bstr::{BString, ByteSlice};
 pub mod parse;
 
 mod prepare;
+#[cfg(windows)]
+mod windows;
 
 ///
 pub mod shebang {
@@ -67,6 +69,8 @@ pub mod shebang {
 /// Convert it to [`std::process::Command`] with [`TryFrom::try_from()`] to finish preparation
 /// without spawning. Preparation reports an error when shell quoting or namespace conversion
 /// requires an encoding the platform cannot represent.
+/// On Windows, MSYS2/Cygwin arguments use `CommandExt::raw_arg`, so `Command::get_args()`
+/// includes their command-line quoting rather than only their decoded contents.
 pub struct Prepare {
     /// The command to invoke, either directly or with a shell depending on `use_shell`.
     pub command: OsString,
@@ -212,6 +216,8 @@ pub fn extract_interpreter(executable: &Path) -> Option<shebang::Data> {
 /// - `stderr` is inherited to allow the command to provide context to the user
 ///
 /// On Windows, terminal Windows will be suppressed automatically.
+/// Executables importing the MSYS2 or Cygwin runtime receive arguments quoted for that runtime,
+/// preventing its quote removal and wildcard expansion from changing their contents.
 ///
 /// ### Warning
 ///

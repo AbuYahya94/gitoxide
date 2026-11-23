@@ -187,6 +187,8 @@ impl TryFrom<Prepare> for Command {
 
     fn try_from(mut prep: Prepare) -> Result<Self> {
         let mut inline_env = Vec::new();
+        #[cfg(windows)]
+        let mut quote_for_shell = false;
         let mut cmd = if prep.use_shell {
             let split_args = prep
                 .allow_manual_arg_splitting
@@ -212,8 +214,22 @@ impl TryFrom<Prepare> for Command {
                 }
                 None => {
                     let mut cmd = match prep.shell_program {
+                        Some(shell) if cfg!(windows) => {
+                            #[cfg(windows)]
+                            {
+                                quote_for_shell = shell == gix_path::env::shell();
+                            }
+                            windows_command(shell, &prep.env, &[])
+                        }
                         Some(shell) => Command::new(shell),
-                        None => gix_path::env::shell_command(),
+                        None => {
+                            #[cfg(windows)]
+                            {
+                                // Git's native shell shim forwards the command line to MSYS2 too.
+                                quote_for_shell = true;
+                            }
+                            gix_path::env::shell_command()
+                        }
                     };
                     // Passed as `command_name` after `-c <script>`; the shell uses it
                     // as `$0`, which prefixes its own diagnostic messages. If the
@@ -250,6 +266,9 @@ impl TryFrom<Prepare> for Command {
         } else {
             Command::new(prep.command)
         };
+        cmd.args(prep.args);
+        #[cfg(windows)]
+        let mut cmd = crate::windows::quote_arguments(cmd, quote_for_shell)?;
         // We never want to have terminals pop-up on Windows if this runs from a GUI application.
         #[cfg(windows)]
         {
@@ -260,8 +279,7 @@ impl TryFrom<Prepare> for Command {
         cmd.stdin(prep.stdin)
             .stdout(prep.stdout)
             .stderr(prep.stderr)
-            .envs(prep.env)
-            .args(prep.args);
+            .envs(prep.env);
         if let Some(ctx) = prep.context {
             if let Some(git_dir) = ctx.git_dir {
                 cmd.env("GIT_DIR", &git_dir);
